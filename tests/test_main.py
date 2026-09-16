@@ -6,12 +6,19 @@ import pytest
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import RequestFactory
+from django.urls import reverse
 from django_scopes import scopes_disabled
-from eventyay.base.models import Question
+from eventyay.base.models import Question, Team
+from eventyay.base.models.auth import User
 from rest_framework import serializers
 
 from exhibition.api import ExhibitorInfoSerializer, LeadCreateView
-from exhibition.forms import ExhibitionProposalForm, ExhibitorInfoForm, SponsorGroupForm
+from exhibition.forms import (
+    ExhibitionProposalForm,
+    ExhibitorDeviceDefaultsForm,
+    ExhibitorInfoForm,
+    SponsorGroupForm,
+)
 from exhibition.models import (
     PROPOSAL_DEFAULT_FIELD_KEYS,
     ExhibitorInfo,
@@ -20,7 +27,6 @@ from exhibition.models import (
     get_next_sponsor_group_level,
 )
 from exhibition.views import (
-    CallTextPreviewView,
     ExhibitionDefaultFieldEditView,
     ExhibitionDefaultFieldResetView,
     ExhibitionQuestionListView,
@@ -228,48 +234,47 @@ def test_sponsor_group_reorder_requires_complete_unique_group_ids(event):
 
 
 @pytest.mark.django_db
-def test_call_text_preview_renders_markdown_per_active_locale(event):
-    event.settings.locales = ["en", "de"]
-    factory = RequestFactory()
-    view = CallTextPreviewView()
+def test_call_settings_form_renders_call_text_without_preview(client, event, settings):
+    settings.DEBUG = True
+    settings.COMPRESS_ENABLED = False
+    settings.COMPRESS_PRECOMPILERS = ()
+    with scopes_disabled():
+        event.plugins = "exhibition"
+        event.save(update_fields=["plugins"])
+        make_exhibitor_settings(event)
 
-    request = factory.post(
-        "/preview",
-        data={
-            "body_en": "# Hello",
-            "body_de": "## Hallo",
+        user = User.objects.create_superuser("admin@dummy.dummy", "dummy")
+        team = Team.objects.create(
+            organizer=event.organizer,
+            all_events=True,
+            can_create_events=True,
+            can_change_teams=True,
+            can_change_organizer_settings=True,
+            can_change_event_settings=True,
+            can_change_items=True,
+            can_view_orders=True,
+            can_change_orders=True,
+            can_view_vouchers=True,
+            can_change_vouchers=True,
+        )
+        team.members.add(user)
+    client.force_login(user)
+
+    url = reverse(
+        "plugins:exhibition:settings.call",
+        kwargs={
+            "organizer": event.organizer.slug,
+            "event": event.slug,
         },
     )
-    request.event = event
-    response = view.post(request)
-
+    response = client.get(url)
     assert response.status_code == 200
-    previews = json.loads(response.content)["previews"]
-    assert set(previews.keys()) == {"en", "de"}
-    assert "<h1>Hello</h1>" in previews["en"]
-    assert "<h2>Hallo</h2>" in previews["de"]
-
-
-@pytest.mark.django_db
-def test_call_text_preview_ignores_inactive_locales_and_blank_text(event):
-    event.settings.locales = ["en"]
-    factory = RequestFactory()
-    view = CallTextPreviewView()
-
-    request = factory.post(
-        "/preview",
-        data={
-            "body_en": "",
-            "body_de": "# Nope",
-        },
-    )
-    request.event = event
-    response = view.post(request)
-
-    assert response.status_code == 200
-    previews = json.loads(response.content)["previews"]
-    assert set(previews.keys()) == {"en"}
-    assert previews["en"] == ""
+    content = response.content.decode()
+    assert 'name="call_text_0"' in content
+    assert 'data-tiptap-profile="richtext"' in content
+    assert "call_text_preview" not in content
+    assert "data-email-preview-wrapper" not in content
+    assert "call-text-preview-note" not in content
 
 
 @pytest.mark.django_db
@@ -509,3 +514,104 @@ def test_lead_data_only_includes_allowed_fields(event):
     assert "email" not in data
     assert "job_title" not in data
     assert "address" not in data
+
+
+@pytest.mark.django_db
+def test_device_defaults_form_saves_the_count(event):
+    settings = make_exhibitor_settings(event)
+    form = ExhibitorDeviceDefaultsForm(data={"device_default_count": 3}, instance=settings)
+
+    assert form.is_valid(), form.errors
+    form.save()
+    settings.refresh_from_db()
+    assert settings.device_default_count == 3
+
+
+@pytest.mark.django_db
+def test_device_defaults_form_caps_the_count_like_manual_provisioning(event):
+    settings = make_exhibitor_settings(event)
+    form = ExhibitorDeviceDefaultsForm(data={"device_default_count": 51}, instance=settings)
+
+    assert not form.is_valid()
+    assert "device_default_count" in form.errors
+    assert ExhibitorDeviceDefaultsForm(data={"device_default_count": 50}, instance=settings).is_valid()
+
+
+@pytest.mark.django_db
+def test_device_defaults_form_rejects_a_negative_count(event):
+    settings = make_exhibitor_settings(event)
+    form = ExhibitorDeviceDefaultsForm(data={"device_default_count": -1}, instance=settings)
+
+    assert not form.is_valid()
+    assert "device_default_count" in form.errors
+
+
+def _settings_post(event, data):
+    request = RequestFactory().post("/", data=data)
+    request.event = event
+    request.user = None
+    request.session = {}
+    request._messages = FallbackStorage(request)
+    view = SettingsView()
+    view.request = request
+    view.kwargs = {}
+    return view.post(request)
+
+
+@pytest.mark.django_db
+def test_lead_settings_save_on_their_own_tab(event):
+    settings = make_exhibitor_settings(event)
+
+    with scopes_disabled():
+        response = _settings_post(event, {"action": "save_lead_settings", "device_default_count": "4"})
+        settings.refresh_from_db()
+
+    assert response.status_code == 302
+    assert response.url.endswith("/settings/leads")
+    assert settings.device_default_count == 4
+
+
+@pytest.mark.django_db
+def test_invalid_lead_settings_render_the_form_instead_of_crashing(event):
+    make_exhibitor_settings(event)
+
+    with scopes_disabled():
+        response = _settings_post(event, {"action": "save_lead_settings", "device_default_count": "-1"})
+
+    assert response.status_code == 200
+    assert "device_default_count" in response.context_data["device_defaults_form"].errors
+
+
+@pytest.mark.django_db
+def test_saving_exhibitor_settings_does_not_touch_the_device_count(event):
+    settings = make_exhibitor_settings(event)
+    settings.device_default_count = 7
+    settings.save()
+
+    with scopes_disabled():
+        _settings_post(
+            event,
+            {"action": "save_exhibitor_settings", "exhibitors_access_voucher": ["attendee_name"]},
+        )
+        settings.refresh_from_db()
+
+    assert settings.allowed_fields == ["attendee_name"]
+    assert settings.device_default_count == 7
+
+
+@pytest.mark.django_db
+def test_sponsor_only_partners_cannot_open_the_devices_page(event):
+    from django.http import Http404
+
+    from exhibition.views import ExhibitorDeviceManageView
+
+    with scopes_disabled():
+        sponsor = ExhibitorInfo.objects.create(event=event, name="Gold", is_exhibitor=False, is_sponsor=True)
+        request = RequestFactory().get("/")
+        request.event = event
+        view = ExhibitorDeviceManageView()
+        view.request = request
+        view.kwargs = {"pk": sponsor.pk}
+
+        with pytest.raises(Http404):
+            view.get_object()
