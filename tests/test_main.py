@@ -268,9 +268,12 @@ def test_sponsor_group_delete_requires_confirmation(client, event, settings):
     group = SponsorGroup.objects.create(event=event, name="Gold", level=1)
 
     response = client.get(sponsor_group_delete_url(event, group))
+    delete_response = client.delete(sponsor_group_delete_url(event, group))
 
     assert response.status_code == 200
+    assert delete_response.status_code == 405
     assert SponsorGroup.objects.filter(pk=group.pk).exists()
+    assert not LogEntry.objects.filter(event=event, action_type=LOG_GROUP_DELETED).exists()
     assert 'Are you sure you want to delete the sponsor group "Gold"?' in response.content.decode()
 
 

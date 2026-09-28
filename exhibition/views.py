@@ -1289,6 +1289,7 @@ class SponsorGroupFrontPageToggleView(EventPermissionRequiredMixin, View):
 
 
 class SponsorGroupDeleteView(EventPermissionRequiredMixin, DeleteView):
+    http_method_names = ["get", "post", "head", "options"]
     model = SponsorGroup
     permission = "can_change_settings"
     template_name = "exhibitors/sponsor_group_delete.html"
