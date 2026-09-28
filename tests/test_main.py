@@ -8,7 +8,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import RequestFactory
 from django.urls import reverse
 from django_scopes import scopes_disabled
-from eventyay.base.models import Question, Team
+from eventyay.base.models import LogEntry, Question, Team
 from eventyay.base.models.auth import User
 from rest_framework import serializers
 
@@ -20,6 +20,7 @@ from exhibition.forms import (
     SponsorGroupForm,
 )
 from exhibition.models import (
+    LOG_GROUP_DELETED,
     REQUEST_DEFAULT_FIELD_KEYS,
     ExhibitorInfo,
     ExhibitorSettings,
@@ -41,6 +42,34 @@ def make_exhibitor_settings(event):
         event=event,
         exhibitors_access_mail_subject="",
         exhibitors_access_mail_body="",
+    )
+
+
+def login_settings_user(client, event, settings):
+    settings.DEBUG = True
+    settings.COMPRESS_ENABLED = False
+    settings.COMPRESS_PRECOMPILERS = ()
+    event.plugins = "exhibition"
+    event.save(update_fields=["plugins"])
+    make_exhibitor_settings(event)
+    user = User.objects.create_superuser("admin@dummy.dummy", "dummy")
+    team = Team.objects.create(
+        organizer=event.organizer,
+        all_events=True,
+        can_change_event_settings=True,
+    )
+    team.members.add(user)
+    client.force_login(user)
+
+
+def sponsor_group_delete_url(event, group):
+    return reverse(
+        "plugins:exhibition:settings.sponsors.delete_group",
+        kwargs={
+            "organizer": event.organizer.slug,
+            "event": event.slug,
+            "pk": group.pk,
+        },
     )
 
 
@@ -231,6 +260,60 @@ def test_sponsor_group_reorder_requires_complete_unique_group_ids(event):
     group_two.refresh_from_db()
     assert group_two.level == 1
     assert group_one.level == 2
+
+
+@pytest.mark.django_db
+def test_sponsor_group_delete_requires_confirmation(client, event, settings):
+    login_settings_user(client, event, settings)
+    group = SponsorGroup.objects.create(event=event, name="Gold", level=1)
+
+    response = client.get(sponsor_group_delete_url(event, group))
+
+    assert response.status_code == 200
+    assert SponsorGroup.objects.filter(pk=group.pk).exists()
+    assert 'Are you sure you want to delete the sponsor group "Gold"?' in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_sponsor_group_delete_removes_empty_group(client, event, settings):
+    login_settings_user(client, event, settings)
+    group = SponsorGroup.objects.create(event=event, name="Gold", level=1)
+
+    response = client.post(sponsor_group_delete_url(event, group))
+
+    assert response.status_code == 302
+    assert response.url == reverse(
+        "plugins:exhibition:settings.sponsors",
+        kwargs={"organizer": event.organizer.slug, "event": event.slug},
+    )
+    assert not SponsorGroup.objects.filter(pk=group.pk).exists()
+    assert LogEntry.objects.filter(event=event, action_type=LOG_GROUP_DELETED).exists()
+
+
+@pytest.mark.django_db
+def test_sponsor_group_delete_is_unavailable_when_assigned(client, event, settings):
+    login_settings_user(client, event, settings)
+    group = SponsorGroup.objects.create(event=event, name="Gold", level=1)
+    ExhibitorInfo.objects.create(
+        event=event,
+        name="Assigned sponsor",
+        is_sponsor=True,
+        sponsor_group=group,
+    )
+    delete_url = sponsor_group_delete_url(event, group)
+
+    settings_response = client.get(
+        reverse(
+            "plugins:exhibition:settings.sponsors",
+            kwargs={"organizer": event.organizer.slug, "event": event.slug},
+        )
+    )
+    delete_response = client.post(delete_url)
+
+    assert delete_url not in settings_response.content.decode()
+    assert delete_response.status_code == 302
+    assert SponsorGroup.objects.filter(pk=group.pk).exists()
+    assert not LogEntry.objects.filter(event=event, action_type=LOG_GROUP_DELETED).exists()
 
 
 @pytest.mark.django_db
