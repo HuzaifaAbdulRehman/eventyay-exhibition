@@ -3,6 +3,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from django.contrib.messages import get_messages
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import transaction
@@ -295,24 +296,34 @@ def test_sponsor_group_delete_removes_empty_group(client, event, settings):
     assert LogEntry.objects.filter(event=event, action_type=LOG_GROUP_DELETED).exists()
 
 
-@pytest.mark.django_db(transaction=True)
+@pytest.mark.django_db
 def test_sponsor_group_delete_locks_group_before_checking_assignments(client, event, settings, monkeypatch):
     login_settings_user(client, event, settings)
     group = SponsorGroup.objects.create(event=event, name="Gold", level=1)
+    connection = transaction.get_connection()
+    base_atomic_depth = len(connection.atomic_blocks)
     lock_states = []
+    delete_states = []
     select_for_update = QuerySet.select_for_update
+    delete = SponsorGroup.delete
 
     def track_sponsor_group_lock(queryset, *args, **kwargs):
         if queryset.model is SponsorGroup:
-            lock_states.append(transaction.get_connection().in_atomic_block)
+            lock_states.append((connection.in_atomic_block, len(connection.atomic_blocks)))
         return select_for_update(queryset, *args, **kwargs)
 
+    def track_sponsor_group_delete(group, *args, **kwargs):
+        delete_states.append((connection.in_atomic_block, len(connection.atomic_blocks)))
+        return delete(group, *args, **kwargs)
+
     monkeypatch.setattr(QuerySet, "select_for_update", track_sponsor_group_lock)
+    monkeypatch.setattr(SponsorGroup, "delete", track_sponsor_group_delete)
 
     response = client.post(sponsor_group_delete_url(event, group))
 
     assert response.status_code == 302
-    assert lock_states == [True]
+    assert lock_states == [(True, base_atomic_depth + 1)]
+    assert delete_states == [(True, base_atomic_depth + 1)]
 
 
 @pytest.mark.django_db
@@ -337,6 +348,8 @@ def test_sponsor_group_delete_is_unavailable_when_assigned(client, event, settin
 
     assert delete_url not in settings_response.content.decode()
     assert delete_response.status_code == 302
+    response_messages = [str(message) for message in get_messages(delete_response.wsgi_request)]
+    assert "This sponsor group cannot be deleted while it is assigned to organizations." in response_messages
     assert SponsorGroup.objects.filter(pk=group.pk).exists()
     assert not LogEntry.objects.filter(event=event, action_type=LOG_GROUP_DELETED).exists()
 
