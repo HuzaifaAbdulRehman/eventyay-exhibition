@@ -1307,7 +1307,9 @@ class SponsorGroupDeleteView(EventPermissionRequiredMixin, DeleteView):
             return redirect(self.get_success_url())
         return response
 
+    @transaction.atomic
     def form_valid(self, form):
+        self.object = self.get_queryset().select_for_update().get(pk=self.object.pk)
         if self.object.organizations.exists():
             messages.error(
                 self.request,

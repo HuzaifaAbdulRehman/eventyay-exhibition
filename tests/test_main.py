@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import transaction
+from django.db.models import QuerySet
 from django.test import RequestFactory
 from django.urls import reverse
 from django_scopes import scopes_disabled
@@ -291,6 +293,26 @@ def test_sponsor_group_delete_removes_empty_group(client, event, settings):
     )
     assert not SponsorGroup.objects.filter(pk=group.pk).exists()
     assert LogEntry.objects.filter(event=event, action_type=LOG_GROUP_DELETED).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_sponsor_group_delete_locks_group_before_checking_assignments(client, event, settings, monkeypatch):
+    login_settings_user(client, event, settings)
+    group = SponsorGroup.objects.create(event=event, name="Gold", level=1)
+    lock_states = []
+    select_for_update = QuerySet.select_for_update
+
+    def track_sponsor_group_lock(queryset, *args, **kwargs):
+        if queryset.model is SponsorGroup:
+            lock_states.append(transaction.get_connection().in_atomic_block)
+        return select_for_update(queryset, *args, **kwargs)
+
+    monkeypatch.setattr(QuerySet, "select_for_update", track_sponsor_group_lock)
+
+    response = client.post(sponsor_group_delete_url(event, group))
+
+    assert response.status_code == 302
+    assert lock_states == [True]
 
 
 @pytest.mark.django_db
