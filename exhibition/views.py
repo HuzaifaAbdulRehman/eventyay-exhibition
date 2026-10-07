@@ -238,13 +238,12 @@ class PublicCallEnabledMixin:
     def has_private_call_access(self, settings):
         return self.request.session.get(call_access_session_key(self.request.event)) == settings.call_secret
 
+    def can_access_private_call(self, settings):
+        return self.has_private_call_access(settings)
+
     def is_call_open(self, settings):
         return settings.call_enabled and (
-            settings.call_is_open
-            or (
-                settings.call_private
-                and self.request.session.get(call_access_session_key(self.request.event)) == settings.call_secret
-            )
+            settings.call_is_open or (settings.call_private and self.has_private_call_access(settings))
         )
 
     def dispatch(self, request, *args, **kwargs):
@@ -253,7 +252,7 @@ class PublicCallEnabledMixin:
             raise Http404()
         if self.hide_after_deadline and settings.call_hide_after_deadline and not self.is_call_open(settings):
             raise Http404()
-        if self.enforce_private and settings.call_private and not self.has_private_call_access(settings):
+        if self.enforce_private and settings.call_private and not self.can_access_private_call(settings):
             raise Http404()
         return super().dispatch(request, *args, **kwargs)
 
@@ -868,8 +867,8 @@ class UserRequestListView(PublicCallEnabledMixin, PublicEventLoginRequiredMixin,
     enforce_private = True
     require_call_enabled = False
 
-    def has_private_call_access(self, settings):
-        if super().has_private_call_access(settings):
+    def can_access_private_call(self, settings):
+        if super().can_access_private_call(settings):
             return True
         user = self.request.user
         if not user.is_authenticated:
